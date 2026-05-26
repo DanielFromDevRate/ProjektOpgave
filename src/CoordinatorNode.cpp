@@ -35,6 +35,7 @@ namespace {
         uint32_t Hash;
         int8_t Rssi[NUM_NODES];
         bool Seen[NUM_NODES];
+        uint32_t NodeSeenMs[NUM_NODES];
         uint32_t LastSeenMs;
         uint32_t Count;
     };
@@ -181,6 +182,7 @@ namespace {
 
         device->Rssi[nodeIndex] = report.Rssi;
         device->Seen[nodeIndex] = true;
+        device->NodeSeenMs[nodeIndex] = millis();
         device->LastSeenMs = millis();
         device->Count++;
     }
@@ -216,14 +218,18 @@ namespace {
         return powf(10.0f, (TX_POWER - rssi) / (10.0f * PATH_LOSS_EXPONENT));
     }
 
-    bool TryCalculatePosition(const TrackedDevice& device, float& x, float& y) {
+    bool IsRecentNodeObservation(const TrackedDevice& device, int nodeIndex, uint32_t now) {
+        return device.Seen[nodeIndex] && now - device.NodeSeenMs[nodeIndex] <= NODE_OBSERVATION_STALE_AFTER_MS;
+    }
+
+    bool TryCalculatePosition(const TrackedDevice& device, float& x, float& y, uint32_t now) {
         float totalWeight = 0.0f;
         float weightedX = 0.0f;
         float weightedY = 0.0f;
         int seenNodeCount = 0;
 
         for (int i = 0; i < NUM_NODES; i++) {
-            if (!device.Seen[i]) {
+            if (!IsRecentNodeObservation(device, i, now)) {
                 continue;
             }
 
@@ -245,11 +251,11 @@ namespace {
         return true;
     }
 
-    int CountSeenNodes(const TrackedDevice& device) {
+    int CountRecentSeenNodes(const TrackedDevice& device, uint32_t now) {
         int count = 0;
 
         for (int i = 0; i < NUM_NODES; i++) {
-            if (device.Seen[i]) {
+            if (IsRecentNodeObservation(device, i, now)) {
                 count++;
             }
         }
@@ -345,24 +351,26 @@ namespace {
                 continue;
             }
 
-            if (CountSeenNodes(device) < 2) {
+            int seenNodes = CountRecentSeenNodes(device, now);
+            if (seenNodes < 2) {
                 continue;
             }
 
             float x;
             float y;
-            if (!TryCalculatePosition(device, x, y)) {
+            if (!TryCalculatePosition(device, x, y, now)) {
                 continue;
             }
 
             snprintf(payload, sizeof(payload),
-                     "{\"type\":\"position\",\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
+                     "{\"type\":\"position\",\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"seen_nodes\":%d,\"x\":%.1f,\"y\":%.1f}",
                      (unsigned long)device.Hash,
                      timestamp,
                      timeSynced ? "true" : "false",
                      (unsigned long)now,
                      (unsigned long)device.LastSeenMs,
                      (unsigned long)device.Count,
+                     seenNodes,
                      x,
                      y);
 
