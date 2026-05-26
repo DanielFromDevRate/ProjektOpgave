@@ -32,7 +32,7 @@ static const uint8_t COORD_MAC[6] =
 
 #define SNIFFER_CHANNEL 2
 
-#define NODE_ID 3
+#define NODE_ID 1
 
 static const float NODE_POS[][2] =
 {
@@ -55,7 +55,7 @@ static const float NODE_POS[][2] =
 // SKIFT DEN HER IP
 //////////////////////////////////////////////////
 
-#define MQTT_HOST   "192.168.1.87"
+#define MQTT_HOST   "wilsons.local"
 
 #define MQTT_PORT   8883
 
