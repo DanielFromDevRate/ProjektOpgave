@@ -3,39 +3,18 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-//////////////////////////////////////////////////
-// ROLE
-//////////////////////////////////////////////////
+// ─── CONFIG (edit before flashing) ───────────────────────────────────────────
 
-#define ROLE_COORDINATOR
-// #define ROLE_SNIFFER
+// Coordinator MAC – flash coordinator first, read MAC from Serial, paste here
+static const uint8_t COORD_MAC[6] = {0xCC, 0xDB, 0xA7, 0x1E, 0x07, 0x64};
 
-//////////////////////////////////////////////////
-// MQTT
-//////////////////////////////////////////////////
-
-#ifdef ROLE_COORDINATOR
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
-#include <math.h>
-#include <time.h>
-#endif
-
-//////////////////////////////////////////////////
-// CONFIG
-//////////////////////////////////////////////////
-
-static const uint8_t COORD_MAC[6] =
-{
-    0xCC, 0xDB, 0xA7, 0x1E, 0x07, 0x64
-};
-
+// Sniffer channel must match the WiFi AP channel the coordinator connects to
 #define SNIFFER_CHANNEL 2
 
-#define NODE_ID 1
+// Each sniffer gets a unique NODE_ID (1..NUM_NODES); coordinator uses 0
+#define NODE_ID 3
 
-static const float NODE_POS[][2] =
-{
+static const float NODE_POS[][2] = {
     {  0,  0 },
     {100,  0 },
     { 50, 87 },
@@ -43,10 +22,7 @@ static const float NODE_POS[][2] =
 
 #define NUM_NODES 3
 
-//////////////////////////////////////////////////
-// WIFI + MQTT
-//////////////////////////////////////////////////
-
+// Coordinator WiFi / MQTT
 #define WIFI_SSID   "IoT_H3/4"
 #define WIFI_PASS   "98806829"
 
@@ -65,54 +41,44 @@ static const float NODE_POS[][2] =
 
 #define MQTT_TOPIC  "devices/device07/position"
 
-//////////////////////////////////////////////////
-// FILTERING
-//////////////////////////////////////////////////
-
+// Keep true while discovering devices. Set false after filling ALLOWED_DEVICE_HASHES.
 #define ALLOW_ALL_DEVICES true
 
-static const uint32_t ALLOWED_DEVICE_HASHES[] =
-{
+// Add allowed device hashes here after discovering them from the sniffer Serial output.
+static const uint32_t ALLOWED_DEVICE_HASHES[] = {
     0,
+    //0x782C50E5,
+    //0x5851599B,
 };
 
-#define NUM_ALLOWED_DEVICES \
-(sizeof(ALLOWED_DEVICE_HASHES) / sizeof(ALLOWED_DEVICE_HASHES[0]))
+#define NUM_ALLOWED_DEVICES (sizeof(ALLOWED_DEVICE_HASHES) / sizeof(ALLOWED_DEVICE_HASHES[0]))
 
+// Sniffer noise filtering. Raise MIN_REPORT_RSSI to only keep closer devices.
 #define MIN_REPORT_RSSI -75
 
 #define SAME_DEVICE_REPORT_INTERVAL_MS 2000
 
 #define REPORT_INTERVAL_MS 10000
 
-//////////////////////////////////////////////////
-// RSSI MODEL
-//////////////////////////////////////////////////
-
+// RSSI → distance model:  d = 10 ^ ((TX_POWER - rssi) / (10 * PATH_N))
 #define TX_POWER  -59.0f
 #define PATH_N     2.0f
 
-//////////////////////////////////////////////////
-// STRUCTS
-//////////////////////////////////////////////////
+// ─── SHARED ──────────────────────────────────────────────────────────────────
 
-struct RssiReport
-{
+struct RssiReport {
     uint8_t  node_id;
     uint32_t mac_hash;
     int8_t   rssi;
 };
 
-//////////////////////////////////////////////////
-// HASH MAC
-//////////////////////////////////////////////////
+// FNV-1a hash
+static uint32_t hashMac(const uint8_t* m) {
 
-static uint32_t hashMac(const uint8_t* m)
-{
     uint32_t h = 2166136261u;
 
-    for (int i = 0; i < 6; i++)
-    {
+    for (int i = 0; i < 6; i++) {
+
         h ^= m[i];
         h *= 16777619u;
     }
@@ -120,17 +86,16 @@ static uint32_t hashMac(const uint8_t* m)
     return h;
 }
 
-//////////////////////////////////////////////////
-// DEVICE FILTER
-//////////////////////////////////////////////////
+static bool isAllowedDevice(uint32_t hash) {
 
-static bool isAllowedDevice(uint32_t hash)
-{
     if (ALLOW_ALL_DEVICES)
         return true;
 
-    for (size_t i = 0; i < NUM_ALLOWED_DEVICES; i++)
-    {
+    for (size_t i = 0; i < NUM_ALLOWED_DEVICES; i++) {
+
+        if (ALLOWED_DEVICE_HASHES[i] == 0)
+            continue;
+
         if (ALLOWED_DEVICE_HASHES[i] == hash)
             return true;
     }
@@ -138,9 +103,9 @@ static bool isAllowedDevice(uint32_t hash)
     return false;
 }
 
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // SNIFFER
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
 #ifdef ROLE_SNIFFER
 
@@ -149,29 +114,21 @@ static esp_now_peer_info_t peer;
 static uint32_t probeCount = 0;
 static uint32_t reportCount = 0;
 
-//////////////////////////////////////////////////
-// RECENT DEVICES
-//////////////////////////////////////////////////
-
 #define RECENT_DEVICE_COUNT 24
 
-struct RecentDevice
-{
+struct RecentDevice {
+
     uint32_t hash;
     uint32_t last_ms;
 };
 
 static RecentDevice recentDevices[RECENT_DEVICE_COUNT];
 
-//////////////////////////////////////////////////
-// FILTER SPAM
-//////////////////////////////////////////////////
-
 static bool shouldReportDevice(
     uint32_t hash,
     int8_t rssi
-)
-{
+) {
+
     if (rssi < MIN_REPORT_RSSI)
         return false;
 
@@ -180,15 +137,14 @@ static bool shouldReportDevice(
     int empty = -1;
     int oldest = 0;
 
-    for (int i = 0; i < RECENT_DEVICE_COUNT; i++)
-    {
-        if (recentDevices[i].hash == hash)
-        {
+    for (int i = 0; i < RECENT_DEVICE_COUNT; i++) {
+
+        if (recentDevices[i].hash == hash) {
+
             if (
                 now - recentDevices[i].last_ms <
                 SAME_DEVICE_REPORT_INTERVAL_MS
-            )
-            {
+            ) {
                 return false;
             }
 
@@ -200,16 +156,14 @@ static bool shouldReportDevice(
         if (
             recentDevices[i].hash == 0 &&
             empty < 0
-        )
-        {
+        ) {
             empty = i;
         }
 
         if (
             recentDevices[i].last_ms <
             recentDevices[oldest].last_ms
-        )
-        {
+        ) {
             oldest = i;
         }
     }
@@ -223,15 +177,11 @@ static bool shouldReportDevice(
     return true;
 }
 
-//////////////////////////////////////////////////
-// SNIFF CALLBACK
-//////////////////////////////////////////////////
-
 static void sniffCb(
     void* buf,
     wifi_promiscuous_pkt_type_t type
-)
-{
+) {
+
     if (type != WIFI_PKT_MGMT)
         return;
 
@@ -249,8 +199,7 @@ static void sniffCb(
     const uint8_t* mac =
         pkt->payload + 10;
 
-    RssiReport r =
-    {
+    RssiReport r = {
         NODE_ID,
         hashMac(mac),
         (int8_t)pkt->rx_ctrl.rssi
@@ -277,19 +226,16 @@ static void sniffCb(
     );
 }
 
-//////////////////////////////////////////////////
-// SETUP
-//////////////////////////////////////////////////
+void setup() {
 
-void setup()
-{
     Serial.begin(115200);
 
     delay(500);
 
     Serial.printf(
-        "Sniffer node %d starting\n",
-        NODE_ID
+        "Sniffer node %d starting on channel %d\n",
+        NODE_ID,
+        SNIFFER_CHANNEL
     );
 
     WiFi.mode(WIFI_STA);
@@ -313,22 +259,18 @@ void setup()
 
     esp_wifi_set_promiscuous_rx_cb(sniffCb);
 
-    Serial.println("Listening...");
+    Serial.println("Listening for probe requests...");
 }
 
-//////////////////////////////////////////////////
-// LOOP
-//////////////////////////////////////////////////
+void loop() {
 
-void loop()
-{
     static uint32_t last = 0;
 
     if (
         millis() - last >
         REPORT_INTERVAL_MS
-    )
-    {
+    ) {
+
         last = millis();
 
         Serial.printf(
@@ -339,31 +281,31 @@ void loop()
     }
 }
 
-#endif
-
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // COORDINATOR
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
-#ifdef ROLE_COORDINATOR
+#elif defined(ROLE_COORDINATOR)
+
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+#include <math.h>
+#include <time.h>
 
 static WiFiClientSecure wc;
 static PubSubClient mqtt(wc);
-
-//////////////////////////////////////////////////
-// TIME
-//////////////////////////////////////////////////
 
 static bool getTimestamp(
     char* buf,
     size_t len,
     uint32_t timeoutMs = 100
-)
-{
+) {
+
     struct tm timeinfo;
 
-    if (getLocalTime(&timeinfo, timeoutMs))
-    {
+    if (getLocalTime(&timeinfo, timeoutMs)) {
+
         strftime(
             buf,
             len,
@@ -384,12 +326,8 @@ static bool getTimestamp(
     return false;
 }
 
-//////////////////////////////////////////////////
-// DEVICE
-//////////////////////////////////////////////////
+struct Device {
 
-struct Device
-{
     uint32_t hash;
 
     int8_t rssi[NUM_NODES];
@@ -407,14 +345,10 @@ static Device devs[MAX_DEV];
 
 static int ndev = 0;
 
-//////////////////////////////////////////////////
-// GET DEVICE
-//////////////////////////////////////////////////
+static Device* getDevice(uint32_t hash) {
 
-static Device* getDevice(uint32_t hash)
-{
-    for (int i = 0; i < ndev; i++)
-    {
+    for (int i = 0; i < ndev; i++) {
+
         if (devs[i].hash == hash)
             return &devs[i];
     }
@@ -431,28 +365,42 @@ static Device* getDevice(uint32_t hash)
     return d;
 }
 
-//////////////////////////////////////////////////
-// ESP NOW RECEIVE
-//////////////////////////////////////////////////
-
 static void onRecv(
     const uint8_t*,
     const uint8_t* data,
     int len
-)
-{
-    if (len != sizeof(RssiReport))
+) {
+
+    Serial.printf(
+        "ESP-NOW recv: %d bytes\n",
+        len
+    );
+
+    if (len != sizeof(RssiReport)) {
+
+        Serial.printf(
+            "bad len (expected %d)\n",
+            sizeof(RssiReport)
+        );
+
         return;
+    }
 
     RssiReport r;
 
     memcpy(&r, data, sizeof(r));
 
+    Serial.printf(
+        "node=%d hash=%08lX rssi=%d\n",
+        r.node_id,
+        (unsigned long)r.mac_hash,
+        r.rssi
+    );
+
     if (
         r.node_id < 1 ||
         r.node_id > NUM_NODES
-    )
-    {
+    ) {
         return;
     }
 
@@ -471,48 +419,38 @@ static void onRecv(
     d->ts = millis();
 
     d->count++;
-
-    Serial.printf(
-        "NODE=%d HASH=%08lX RSSI=%d\n",
-        r.node_id,
-        (unsigned long)r.mac_hash,
-        r.rssi
-    );
 }
 
-//////////////////////////////////////////////////
-// CALCULATE POSITION
-//////////////////////////////////////////////////
-
+// Weighted centroid
 static bool calcPos(
     Device* d,
     float& x,
     float& y
-)
-{
+) {
+
     float sw = 0;
     float sx = 0;
     float sy = 0;
 
     int n = 0;
 
-    for (int i = 0; i < NUM_NODES; i++)
-    {
+    for (int i = 0; i < NUM_NODES; i++) {
+
         if (!d->seen[i])
             continue;
 
-        float dist =
-            powf(
-                10.0f,
-                (TX_POWER - d->rssi[i]) /
-                (10.0f * PATH_N)
-            );
+        float dist = powf(
+            10.0f,
+            (TX_POWER - d->rssi[i]) /
+            (10.0f * PATH_N)
+        );
 
         float w =
             1.0f /
             (dist * dist + 1e-4f);
 
         sx += w * NODE_POS[i][0];
+
         sy += w * NODE_POS[i][1];
 
         sw += w;
@@ -529,81 +467,34 @@ static bool calcPos(
     return true;
 }
 
-//////////////////////////////////////////////////
-// MQTT CONNECT
-//////////////////////////////////////////////////
-
-static void reconnectMQTT()
-{
-    while (!mqtt.connected())
-    {
-        Serial.println("Connecting MQTT...");
-
-        bool ok =
-            mqtt.connect(
-                DEVICE_ID,
-                MQTT_USER,
-                MQTT_PASS
-            );
-
-        if (ok)
-        {
-            Serial.println("MQTT OK");
-
-            bool test =
-                mqtt.publish(
-                    "test/topic",
-                    "HELLO_FROM_ESP32"
-                );
-
-            Serial.print("TEST PUBLISH: ");
-
-            Serial.println(test);
-        }
-        else
-        {
-            Serial.print("MQTT FAILED state=");
-
-            Serial.println(mqtt.state());
-
-            delay(3000);
-        }
-    }
-}
-
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // SETUP
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
-void setup()
-{
+void setup() {
+
     Serial.begin(115200);
 
     delay(500);
 
-    //////////////////////////////////////////////////
-    // WIFI
-    //////////////////////////////////////////////////
-
-    Serial.println("Connecting WiFi...");
+    Serial.println("Connecting to WiFi...");
 
     WiFi.begin(
         WIFI_SSID,
         WIFI_PASS
     );
 
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.print(".");
+    while (WiFi.status() != WL_CONNECTED) {
+
+        Serial.print('.');
 
         delay(500);
     }
 
-    Serial.println();
-
     Serial.printf(
-        "WiFi OK  IP: %s  Channel: %d\n",
+        "\nWiFi OK  IP: %s  MAC: %s  Channel: %d\n",
         WiFi.localIP().toString().c_str(),
+        WiFi.macAddress().c_str(),
         WiFi.channel()
     );
 
@@ -626,6 +517,19 @@ void setup()
         "time.nist.gov"
     );
 
+    char timestamp[32];
+
+    getTimestamp(
+        timestamp,
+        sizeof(timestamp),
+        5000
+    );
+
+    Serial.printf(
+        "Time: %s\n",
+        timestamp
+    );
+
     //////////////////////////////////////////////////
     // ESP NOW
     //////////////////////////////////////////////////
@@ -637,7 +541,7 @@ void setup()
     Serial.println("ESP-NOW OK");
 
     //////////////////////////////////////////////////
-    // MQTT TLS
+    // MQTT
     //////////////////////////////////////////////////
 
     wc.setInsecure();
@@ -647,24 +551,96 @@ void setup()
         MQTT_PORT
     );
 
-    reconnectMQTT();
+    Serial.printf(
+        "MQTT connecting to %s:%d...\n",
+        MQTT_HOST,
+        MQTT_PORT
+    );
 
-    Serial.println("COORDINATOR READY");
+    bool mqttConnected =
+        mqtt.connect(
+            DEVICE_ID,
+            MQTT_USER,
+            MQTT_PASS
+        );
+
+    if (mqttConnected) {
+
+        Serial.println("MQTT OK");
+
+        bool ok =
+            mqtt.publish(
+                "test/topic",
+                "HELLO_FROM_ESP32"
+            );
+
+        Serial.print(
+            "TEST PUBLISH: "
+        );
+
+        Serial.println(ok);
+    }
+    else {
+
+        Serial.printf(
+            "MQTT FAILED state=%d\n",
+            mqtt.state()
+        );
+    }
 }
 
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // LOOP
-//////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
-void loop()
-{
+void loop() {
+
     //////////////////////////////////////////////////
-    // MQTT
+    // MQTT RECONNECT
     //////////////////////////////////////////////////
 
-    if (!mqtt.connected())
-    {
-        reconnectMQTT();
+    if (!mqtt.connected()) {
+
+        static uint32_t lastRetry = 0;
+
+        if (
+            millis() - lastRetry >
+            5000
+        ) {
+
+            lastRetry = millis();
+
+            Serial.printf(
+                "MQTT reconnecting... state=%d\n",
+                mqtt.state()
+            );
+
+            bool ok =
+                mqtt.connect(
+                    DEVICE_ID,
+                    MQTT_USER,
+                    MQTT_PASS
+                );
+
+            if (ok) {
+
+                Serial.println(
+                    "MQTT RECONNECTED"
+                );
+
+                mqtt.publish(
+                    "test/topic",
+                    "RECONNECTED"
+                );
+            }
+            else {
+
+                Serial.printf(
+                    "MQTT reconnect failed state=%d\n",
+                    mqtt.state()
+                );
+            }
+        }
     }
 
     mqtt.loop();
@@ -678,8 +654,7 @@ void loop()
     if (
         millis() - last <
         REPORT_INTERVAL_MS
-    )
-    {
+    ) {
         return;
     }
 
@@ -697,13 +672,12 @@ void loop()
             sizeof(timestamp)
         );
 
-    for (int i = 0; i < ndev; i++)
-    {
+    for (int i = 0; i < ndev; i++) {
+
         if (
             now - devs[i].ts >
             30000
-        )
-        {
+        ) {
             continue;
         }
 
@@ -716,10 +690,12 @@ void loop()
         snprintf(
             buf,
             sizeof(buf),
-            "{\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
+            "{\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
             (unsigned long)devs[i].hash,
             timestamp,
             timeSynced ? "true" : "false",
+            (unsigned long)now,
+            (unsigned long)devs[i].ts,
             (unsigned long)devs[i].count,
             x,
             y
@@ -732,8 +708,9 @@ void loop()
             );
 
         Serial.printf(
-            "[MQTT] %s %s\n",
+            "[MQTT] Publish %s %s %s\n",
             ok ? "OK" : "FAILED",
+            MQTT_TOPIC,
             buf
         );
     }
