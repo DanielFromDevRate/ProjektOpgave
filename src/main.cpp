@@ -12,7 +12,7 @@ static const uint8_t COORD_MAC[6] = {0xCC, 0xDB, 0xA7, 0x1E, 0x07, 0x64};
 #define SNIFFER_CHANNEL 2
 
 // Each sniffer gets a unique NODE_ID (1..NUM_NODES); coordinator uses 0
-#define NODE_ID 3
+#define NODE_ID 1
 
 static const float NODE_POS[][2] = {
     {  0,  0 },
