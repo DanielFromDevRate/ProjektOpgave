@@ -12,7 +12,7 @@ static const uint8_t COORD_MAC[6] = {0xCC, 0xDB, 0xA7, 0x1E, 0x07, 0x64};
 #define SNIFFER_CHANNEL 2
 
 // Each sniffer gets a unique NODE_ID (1..NUM_NODES); coordinator uses 0
-#define NODE_ID 3
+#define NODE_ID 1
 
 static const float NODE_POS[][2] = {
     {  0,  0 },
@@ -148,6 +148,20 @@ static bool popSniffDebug(SniffDebugReport& r) {
     return true;
 }
 
+static bool isRandomizedMac(const uint8_t* mac) {
+    return (mac[0] & 0x02) != 0;
+}
+
+static bool isMulticastMac(const uint8_t* mac) {
+    return (mac[0] & 0x01) != 0;
+}
+
+static const char* macType(const uint8_t* mac) {
+    if (isMulticastMac(mac)) return "multicast";
+    if (isRandomizedMac(mac)) return "randomized";
+    return "vendor";
+}
+
 #define SNIFF_DEBUG_DEVICE_COUNT 32
 struct SniffDebugDevice {
     uint32_t hash;
@@ -156,6 +170,8 @@ struct SniffDebugDevice {
     uint32_t last_ms;
     int8_t last_rssi;
     bool allowed;
+    bool randomized_mac;
+    const char* mac_type;
 };
 
 static SniffDebugDevice sniffDebugDevices[SNIFF_DEBUG_DEVICE_COUNT];
@@ -183,6 +199,8 @@ static void rememberSniffDebug(const SniffDebugReport& r) {
     d->last_ms = millis();
     d->last_rssi = r.report.rssi;
     d->allowed = isAllowedDevice(r.report.mac_hash);
+    d->randomized_mac = isRandomizedMac(d->mac);
+    d->mac_type = macType(d->mac);
 }
 
 static void printSniffDebugReport() {
@@ -195,13 +213,15 @@ static void printSniffDebugReport() {
         if (!first) Serial.println(",");
         first = false;
         Serial.printf(
-            "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"hash\":\"%08lX\",\"count\":%lu,\"last_seen_ms\":%lu,\"last_rssi\":%d,\"allowed\":%s}",
+            "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"hash\":\"%08lX\",\"count\":%lu,\"last_seen_ms\":%lu,\"last_rssi\":%d,\"allowed\":%s,\"randomized_mac\":%s,\"mac_type\":\"%s\"}",
             d.mac[0], d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5],
             (unsigned long)d.hash,
             (unsigned long)d.count,
             (unsigned long)d.last_ms,
             d.last_rssi,
-            d.allowed ? "true" : "false");
+            d.allowed ? "true" : "false",
+            d.randomized_mac ? "true" : "false",
+            d.mac_type);
     }
     Serial.println("]}");
     Serial.printf("Probe requests seen: %lu, reported after filters: %lu\n",
@@ -333,6 +353,14 @@ static bool calcPos(Device* d, float& x, float& y) {
     return true;
 }
 
+static int seenNodeCount(Device* d) {
+    int n = 0;
+    for (int i = 0; i < NUM_NODES; i++) {
+        if (d->seen[i]) n++;
+    }
+    return n;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -384,6 +412,7 @@ void loop() {
     bool timeSynced = getTimestamp(timestamp, sizeof(timestamp));
     for (int i = 0; i < ndev; i++) {
         if (now - devs[i].ts > 30000) continue;  // discard stale entries (>30 s)
+        if (seenNodeCount(&devs[i]) < 2) continue;
         float x, y;
         if (!calcPos(&devs[i], x, y)) continue;
         snprintf(buf, sizeof(buf),
