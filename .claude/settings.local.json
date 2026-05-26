@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:s0ren.github.io)",
+      "PowerShell(cd \"C:\\\\Users\\\\Daniel\\\\Documents\\\\PlatformIO\\\\Projects\\\\ProjektOpgave\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e coordinator 2>&1)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}
