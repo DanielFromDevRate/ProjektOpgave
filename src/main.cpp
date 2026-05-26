@@ -6,13 +6,13 @@
 // ─── CONFIG (edit before flashing) ───────────────────────────────────────────
 
 // Coordinator MAC – flash coordinator first, read MAC from Serial, paste here
-static const uint8_t COORD_MAC[6] = {0xCC, 0xDB, 0xA7, 0x1E, 0x07, 0x64};
+static const uint8_t COORD_MAC[6] = {0xEC, 0x64, 0xC9, 0x85, 0xF5, 0x8C};
 
 // Sniffer channel must match the WiFi AP channel the coordinator connects to
 #define SNIFFER_CHANNEL 2
 
 // Each sniffer gets a unique NODE_ID (1..NUM_NODES); coordinator uses 0
-#define NODE_ID 1
+#define NODE_ID 3
 
 static const float NODE_POS[][2] = {
     {  0,  0 },
@@ -29,7 +29,9 @@ static const float NODE_POS[][2] = {
 #define DEVICE_ID   "device07"
 #define MQTT_USER   "device07"
 #define MQTT_PASS   "madTdHrb"
-#define MQTT_TOPIC  "devices/device07/position"
+#define MQTT_BASE_TOPIC       "/devices/device07"
+#define MQTT_SNIFFER_TOPIC    MQTT_BASE_TOPIC "/sniffer_result"
+#define MQTT_POSITION_TOPIC   MQTT_BASE_TOPIC "/position"
 
 // Keep true while discovering devices. Set false after filling ALLOWED_DEVICE_HASHES.
 #define ALLOW_ALL_DEVICES true
@@ -245,6 +247,10 @@ static void sniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     esp_now_send(COORD_MAC, (uint8_t*)&r, sizeof(r));
 }
 
+static void onEspNowSent(const uint8_t*, esp_now_send_status_t status) {
+    Serial.printf("ESP-NOW send %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -254,6 +260,7 @@ void setup() {
     esp_wifi_set_channel(SNIFFER_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
     esp_now_init();
+    esp_now_register_send_cb(onEspNowSent);
     memcpy(peer.peer_addr, COORD_MAC, 6);
     peer.channel = SNIFFER_CHANNEL;
     peer.encrypt = false;
@@ -288,6 +295,21 @@ void loop() {
 static WiFiClientSecure wc;
 static PubSubClient     mqtt(wc);
 
+enum NetState { WIFI_CONNECTING, NTP_SYNCING, MQTT_CONNECTING, NET_READY };
+static NetState netState = WIFI_CONNECTING;
+static uint32_t netStateStart = 0;
+
+struct QueuedRssiReport {
+    RssiReport report;
+    uint32_t received_ms;
+};
+
+#define RSSI_REPORT_QUEUE_SIZE 24
+static QueuedRssiReport rssiReportQueue[RSSI_REPORT_QUEUE_SIZE];
+static volatile uint8_t rssiReportHead = 0;
+static volatile uint8_t rssiReportTail = 0;
+static portMUX_TYPE rssiReportMux = portMUX_INITIALIZER_UNLOCKED;
+
 static bool getTimestamp(char* buf, size_t len, uint32_t timeoutMs = 100) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, timeoutMs)) {
@@ -310,6 +332,76 @@ struct Device {
 static Device devs[MAX_DEV];
 static int    ndev = 0;
 
+static void startNTP() {
+    Serial.printf("\n[WiFi] OK IP=%s MAC=%s Channel=%d GW=%s DNS=%s\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.macAddress().c_str(),
+                  WiFi.channel(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str());
+    configTime(0, 0, "0.dk.pool.ntp.org", "pool.ntp.org", "time.google.com");
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+    Serial.println("[NTP] Syncing...");
+    netState = NTP_SYNCING;
+    netStateStart = millis();
+}
+
+static void startMQTT() {
+    wc.setInsecure();  // TLS without certificate verification
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    Serial.printf("[MQTT] Connecting to %s:%d...\n", MQTT_HOST, MQTT_PORT);
+    netState = MQTT_CONNECTING;
+    netStateStart = millis();
+}
+
+static bool mqttReady() {
+    return netState == NET_READY && mqtt.connected();
+}
+
+static bool publishMqtt(const char* topic, const char* payload) {
+    if (!mqttReady()) {
+        Serial.printf("[MQTT] Not ready %s\n", topic);
+        return false;
+    }
+    bool ok = mqtt.publish(topic, payload);
+    Serial.printf("[MQTT] Publish %s %s %s\n", ok ? "OK" : "FAILED", topic, payload);
+    return ok;
+}
+
+static bool queueRssiReport(const RssiReport& report) {
+    portENTER_CRITICAL(&rssiReportMux);
+    uint8_t next = (rssiReportHead + 1) % RSSI_REPORT_QUEUE_SIZE;
+    if (next == rssiReportTail) {
+        portEXIT_CRITICAL(&rssiReportMux);
+        return false;
+    }
+    rssiReportQueue[rssiReportHead].report = report;
+    rssiReportQueue[rssiReportHead].received_ms = millis();
+    rssiReportHead = next;
+    portEXIT_CRITICAL(&rssiReportMux);
+    return true;
+}
+
+static bool peekRssiReport(QueuedRssiReport& queued) {
+    portENTER_CRITICAL(&rssiReportMux);
+    if (rssiReportTail == rssiReportHead) {
+        portEXIT_CRITICAL(&rssiReportMux);
+        return false;
+    }
+    queued = rssiReportQueue[rssiReportTail];
+    portEXIT_CRITICAL(&rssiReportMux);
+    return true;
+}
+
+static void dropQueuedRssiReport() {
+    portENTER_CRITICAL(&rssiReportMux);
+    if (rssiReportTail != rssiReportHead) {
+        rssiReportTail = (rssiReportTail + 1) % RSSI_REPORT_QUEUE_SIZE;
+    }
+    portEXIT_CRITICAL(&rssiReportMux);
+}
+
 static Device* getDevice(uint32_t hash) {
     for (int i = 0; i < ndev; i++)
         if (devs[i].hash == hash) return &devs[i];
@@ -327,6 +419,7 @@ static void onRecv(const uint8_t*, const uint8_t* data, int len) {
     Serial.printf("  node=%d hash=%08lX rssi=%d\n", r.node_id, (unsigned long)r.mac_hash, r.rssi);
     if (r.node_id < 1 || r.node_id > NUM_NODES) { Serial.printf("  bad node_id\n"); return; }
     if (!isAllowedDevice(r.mac_hash)) { Serial.printf("  blocked device\n"); return; }
+    if (!queueRssiReport(r)) Serial.println("  report queue full");
     Device* d = getDevice(r.mac_hash);
     d->rssi[r.node_id - 1] = r.rssi;
     d->seen[r.node_id - 1] = true;
@@ -361,62 +454,109 @@ static int seenNodeCount(Device* d) {
     return n;
 }
 
+static void updateNetwork() {
+    uint32_t now = millis();
+    switch (netState) {
+        case WIFI_CONNECTING:
+            if (WiFi.status() == WL_CONNECTED) {
+                startNTP();
+            } else if (now - netStateStart > 15000) {
+                Serial.println("[WiFi] Timeout - retrying...");
+                WiFi.reconnect();
+                netStateStart = now;
+            }
+            break;
+
+        case NTP_SYNCING: {
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                char timestamp[32];
+                getTimestamp(timestamp, sizeof(timestamp));
+                Serial.printf("[NTP] OK %s\n", timestamp);
+                startMQTT();
+            } else if (now - netStateStart > 20000) {
+                Serial.println("[NTP] FAILED - continuing without time sync");
+                startMQTT();
+            }
+            break;
+        }
+
+        case MQTT_CONNECTING:
+            if (mqtt.connected()) {
+                Serial.println("[MQTT] OK");
+                netState = NET_READY;
+            } else if (now - netStateStart > 500) {
+                mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS);
+                netStateStart = now;
+                if (!mqtt.connected()) Serial.printf("[MQTT] state=%d retrying...\n", mqtt.state());
+            }
+            break;
+
+        case NET_READY:
+            mqtt.loop();
+            if (!mqtt.connected() && WiFi.status() == WL_CONNECTED) {
+                Serial.println("[MQTT] Lost connection - reconnecting...");
+                netState = MQTT_CONNECTING;
+                netStateStart = now;
+            }
+            break;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("Connecting to WiFi...");
+    Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) { Serial.print('.'); delay(500); }
-    Serial.printf("\nWiFi OK  IP: %s  MAC: %s  Channel: %d\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.macAddress().c_str(), WiFi.channel());
-
-    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
-    tzset();
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    char timestamp[32];
-    getTimestamp(timestamp, sizeof(timestamp), 5000);
-    Serial.printf("Time: %s\n", timestamp);
+    netState = WIFI_CONNECTING;
+    netStateStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        updateNetwork();
+        delay(50);
+    }
 
     esp_now_init();
     esp_now_register_recv_cb(onRecv);
     Serial.println("ESP-NOW OK");
-
-    wc.setInsecure();  // TLS without certificate verification
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    Serial.printf("MQTT connecting to %s:%d...\n", MQTT_HOST, MQTT_PORT);
-    if (mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS))
-        Serial.println("MQTT OK");
-    else
-        Serial.printf("MQTT FAILED state=%d\n", mqtt.state());
 }
 
 void loop() {
-    if (!mqtt.connected()) {
-        static uint32_t lastRetry = 0;
-        if (millis() - lastRetry > 5000) {
-            lastRetry = millis();
-            Serial.printf("MQTT reconnecting... state=%d\n", mqtt.state());
-            mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS);
-        }
-    }
-    mqtt.loop();
+    updateNetwork();
 
     static uint32_t last = 0;
-    if (millis() - last < REPORT_INTERVAL_MS) return;
-    last = millis();
-
     char buf[256];
     char timestamp[32];
-    uint32_t now = millis();
     bool timeSynced = getTimestamp(timestamp, sizeof(timestamp));
+    if (mqttReady()) {
+        QueuedRssiReport queued;
+        while (peekRssiReport(queued)) {
+            snprintf(buf, sizeof(buf),
+                "{\"type\":\"sniffer_result\",\"id\":\"%08lX\",\"node_id\":%u,\"rssi\":%d,\"timestamp\":\"%s\",\"time_synced\":%s,\"received_ms\":%lu}",
+                (unsigned long)queued.report.mac_hash,
+                queued.report.node_id,
+                queued.report.rssi,
+                timestamp,
+                timeSynced ? "true" : "false",
+                (unsigned long)queued.received_ms);
+            bool ok = publishMqtt(MQTT_SNIFFER_TOPIC, buf);
+            if (!ok) break;
+            dropQueuedRssiReport();
+        }
+    }
+
+    if (millis() - last < REPORT_INTERVAL_MS) return;
+    last = millis();
+    if (!mqttReady()) return;
+
+    uint32_t now = millis();
     for (int i = 0; i < ndev; i++) {
         if (now - devs[i].ts > 30000) continue;  // discard stale entries (>30 s)
         if (seenNodeCount(&devs[i]) < 2) continue;
         float x, y;
         if (!calcPos(&devs[i], x, y)) continue;
         snprintf(buf, sizeof(buf),
-            "{\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
+            "{\"type\":\"position\",\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
             (unsigned long)devs[i].hash,
             timestamp,
             timeSynced ? "true" : "false",
@@ -424,8 +564,7 @@ void loop() {
             (unsigned long)devs[i].ts,
             (unsigned long)devs[i].count,
             x, y);
-        bool ok = mqtt.publish(MQTT_TOPIC, buf);
-        Serial.printf("[MQTT] Publish %s %s %s\n", ok ? "OK" : "FAILED", MQTT_TOPIC, buf);
+        publishMqtt(MQTT_POSITION_TOPIC, buf);
     }
 }
 
