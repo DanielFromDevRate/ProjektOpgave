@@ -64,6 +64,7 @@ struct KnownDevice {
 static const KnownDevice KNOWN_DEVICES[] = {
     {0x80465F21, "test_device"},
     {0x1A2F4832, "daniel_pc"},
+    {0xBE463ED8, "daniel_phone"},
 };
 #define NUM_KNOWN_DEVICES (sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]))
 
@@ -74,11 +75,13 @@ static const KnownDevice KNOWN_DEVICES[] = {
 #define REPORT_INTERVAL_MS 10000
 #define PUBLISH_BATCH_INTERVAL_MS 10000
 #define DEVICE_STALE_AFTER_MS 30000
-#define MIN_POSITION_NODES 2
+#define MIN_POSITION_NODES 3
 #define MQTT_PACKET_BUFFER_SIZE 1024
 
 // RSSI → distance model:  d = 10 ^ ((TX_POWER - rssi) / (10 * PATH_N))
+// Tune TX_POWER and PATH_N by measuring RSSI at known distances in the actual room.
 #define TX_POWER  -59.0f   // measured RSSI at 1 m
+#define RSSI_DISTANCE_TO_COORD_SCALE 100.0f  // RSSI model returns meters; NODE_POS is in cm
 #define PATH_N     2.0f    // path-loss exponent (free space ≈ 2)
 
 // ─── SHARED ──────────────────────────────────────────────────────────────────
@@ -87,6 +90,7 @@ struct RssiReport {
     uint8_t  node_id;
     uint32_t mac_hash;  // one-way FNV-1a hash – raw MAC is never transmitted
     int8_t   rssi;
+    uint8_t  mac_flags;
 };
 
 // FNV-1a: irreversible pseudonym; satisfies GDPR data-minimisation requirement
@@ -94,6 +98,30 @@ static uint32_t hashMac(const uint8_t* m) {
     uint32_t h = 2166136261u;
     for (int i = 0; i < 6; i++) { h ^= m[i]; h *= 16777619u; }
     return h;
+}
+
+#define MAC_FLAG_RANDOMIZED 0x01
+#define MAC_FLAG_MULTICAST  0x02
+
+static bool isRandomizedMac(const uint8_t* mac) {
+    return (mac[0] & 0x02) != 0;
+}
+
+static bool isMulticastMac(const uint8_t* mac) {
+    return (mac[0] & 0x01) != 0;
+}
+
+static uint8_t macFlags(const uint8_t* mac) {
+    uint8_t flags = 0;
+    if (isRandomizedMac(mac)) flags |= MAC_FLAG_RANDOMIZED;
+    if (isMulticastMac(mac)) flags |= MAC_FLAG_MULTICAST;
+    return flags;
+}
+
+static const char* macTypeFromFlags(uint8_t flags) {
+    if (flags & MAC_FLAG_MULTICAST) return "multicast";
+    if (flags & MAC_FLAG_RANDOMIZED) return "randomized";
+    return "vendor";
 }
 
 static bool isAllowedDevice(uint32_t hash) {
@@ -189,18 +217,8 @@ static bool popSniffDebug(SniffDebugReport& r) {
     return true;
 }
 
-static bool isRandomizedMac(const uint8_t* mac) {
-    return (mac[0] & 0x02) != 0;
-}
-
-static bool isMulticastMac(const uint8_t* mac) {
-    return (mac[0] & 0x01) != 0;
-}
-
 static const char* macType(const uint8_t* mac) {
-    if (isMulticastMac(mac)) return "multicast";
-    if (isRandomizedMac(mac)) return "randomized";
-    return "vendor";
+    return macTypeFromFlags(macFlags(mac));
 }
 
 #define SNIFF_DEBUG_DEVICE_COUNT 32
@@ -278,7 +296,7 @@ static void sniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     probeCount++;
     // Source MAC is at byte offset 10 in the 802.11 management frame header
     const uint8_t* mac = pkt->payload + 10;
-    RssiReport r = { NODE_ID, hashMac(mac), (int8_t)pkt->rx_ctrl.rssi };
+    RssiReport r = { NODE_ID, hashMac(mac), (int8_t)pkt->rx_ctrl.rssi, macFlags(mac) };
     if (!shouldReportDevice(r.mac_hash, r.rssi)) return;
     queueSniffDebug(r, mac);
     if (!isAllowedDevice(r.mac_hash)) return;
@@ -351,6 +369,7 @@ static bool getTimestamp(char* buf, size_t len, uint32_t timeoutMs = 100) {
 struct Device {
     uint32_t hash;
     int8_t   rssi[NUM_NODES];
+    uint8_t  mac_flags[NUM_NODES];
     bool     seen[NUM_NODES];
     uint32_t node_ts[NUM_NODES];
     uint32_t ts;
@@ -444,6 +463,7 @@ static Device* getDevice(uint32_t hash) {
 static void rememberReport(const RssiReport& r) {
     Device* d = getDevice(r.mac_hash);
     d->rssi[r.node_id - 1] = r.rssi;
+    d->mac_flags[r.node_id - 1] = r.mac_flags;
     d->seen[r.node_id - 1] = true;
     d->node_ts[r.node_id - 1] = millis();
     d->ts = millis();
@@ -469,7 +489,7 @@ static void coordSniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     coordProbeCount++;
     const uint8_t* mac = pkt->payload + 10;
-    RssiReport r = { NODE_ID, hashMac(mac), (int8_t)pkt->rx_ctrl.rssi };
+    RssiReport r = { NODE_ID, hashMac(mac), (int8_t)pkt->rx_ctrl.rssi, macFlags(mac) };
     if (!shouldKeepCoordinatorProbe(r.mac_hash, r.rssi)) return;
     if (!isAllowedDevice(r.mac_hash)) return;
 
@@ -477,26 +497,53 @@ static void coordSniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     rememberReport(r);
 }
 
-// Weighted centroid: weight = 1/d² where d = RSSI-derived distance
+// Trilateration uses three RSSI-derived distances in the same unit as NODE_POS.
 static bool isRecentNode(Device* d, int nodeIndex, uint32_t now) {
     return d->seen[nodeIndex] && now - d->node_ts[nodeIndex] <= DEVICE_STALE_AFTER_MS;
 }
 
-static bool calcPos(Device* d, float& x, float& y, uint32_t now) {
-    float sw = 0, sx = 0, sy = 0;
-    int n = 0;
+struct PositionResult {
+    float x;
+    float y;
+    float dist[NUM_NODES];
+    float fit_error;
+};
+
+static float rssiToDistance(int8_t rssi) {
+    return powf(10.0f, (TX_POWER - rssi) / (10.0f * PATH_N)) * RSSI_DISTANCE_TO_COORD_SCALE;
+}
+
+static bool calcTrilateration(Device* d, PositionResult& result, uint32_t now) {
     for (int i = 0; i < NUM_NODES; i++) {
-        if (!isRecentNode(d, i, now)) continue;
-        float dist = powf(10.0f, (TX_POWER - d->rssi[i]) / (10.0f * PATH_N));
-        float w = 1.0f / (dist * dist + 1e-4f);
-        sx += w * NODE_POS[i][0];
-        sy += w * NODE_POS[i][1];
-        sw += w;
-        n++;
+        if (!isRecentNode(d, i, now)) return false;
+        result.dist[i] = rssiToDistance(d->rssi[i]);
     }
-    if (n < 1 || sw == 0.0f) return false;
-    x = sx / sw;
-    y = sy / sw;
+
+    const float x1 = NODE_POS[0][0], y1 = NODE_POS[0][1], d1 = result.dist[0];
+    const float x2 = NODE_POS[1][0], y2 = NODE_POS[1][1], d2 = result.dist[1];
+    const float x3 = NODE_POS[2][0], y3 = NODE_POS[2][1], d3 = result.dist[2];
+
+    const float a = 2.0f * (x2 - x1);
+    const float b = 2.0f * (y2 - y1);
+    const float c = (d1 * d1) - (d2 * d2) - (x1 * x1) + (x2 * x2) - (y1 * y1) + (y2 * y2);
+    const float e = 2.0f * (x3 - x1);
+    const float f = 2.0f * (y3 - y1);
+    const float g = (d1 * d1) - (d3 * d3) - (x1 * x1) + (x3 * x3) - (y1 * y1) + (y3 * y3);
+
+    const float det = (a * f) - (b * e);
+    if (fabsf(det) < 1e-3f) return false;
+
+    result.x = ((c * f) - (b * g)) / det;
+    result.y = ((a * g) - (c * e)) / det;
+
+    float totalError = 0.0f;
+    for (int i = 0; i < NUM_NODES; i++) {
+        const float dx = result.x - NODE_POS[i][0];
+        const float dy = result.y - NODE_POS[i][1];
+        const float solvedDistance = sqrtf((dx * dx) + (dy * dy));
+        totalError += fabsf(solvedDistance - result.dist[i]);
+    }
+    result.fit_error = totalError / NUM_NODES;
     return true;
 }
 
@@ -514,6 +561,18 @@ static int bestRecentRssi(Device* d, uint32_t now) {
         if (isRecentNode(d, i, now) && d->rssi[i] > best) best = d->rssi[i];
     }
     return best;
+}
+
+static uint8_t bestRecentMacFlags(Device* d, uint32_t now) {
+    int best = -128;
+    uint8_t flags = 0;
+    for (int i = 0; i < NUM_NODES; i++) {
+        if (isRecentNode(d, i, now) && d->rssi[i] > best) {
+            best = d->rssi[i];
+            flags = d->mac_flags[i];
+        }
+    }
+    return flags;
 }
 
 static int selectPublishCandidates(uint8_t* indexes, uint32_t now) {
@@ -567,16 +626,19 @@ static void publishSnifferBatch(const uint8_t* candidates, int candidateCount, c
         for (int node = 0; node < NUM_NODES; node++) {
             if (!isRecentNode(d, node, now)) continue;
 
-            char item[160];
+            uint8_t flags = d->mac_flags[node];
+            char item[220];
             snprintf(
                     item,
                     sizeof(item),
-                    "{\"id\":\"%08lX\",\"label\":\"%s\",\"node_id\":%d,\"rssi\":%d,\"received_ms\":%lu}",
+                    "{\"id\":\"%08lX\",\"label\":\"%s\",\"node_id\":%d,\"rssi\":%d,\"received_ms\":%lu,\"mac_type\":\"%s\",\"randomized_mac\":%s}",
                     (unsigned long)d->hash,
                     deviceLabel(d->hash),
                     node + 1,
                     d->rssi[node],
-                    (unsigned long)d->node_ts[node]);
+                    (unsigned long)d->node_ts[node],
+                    macTypeFromFlags(flags),
+                    (flags & MAC_FLAG_RANDOMIZED) ? "true" : "false");
 
             if (used + strlen(item) + (resultCount > 0 ? 1 : 0) >= sizeof(results)) {
                 break;
@@ -607,22 +669,28 @@ static void publishPositionBatch(const uint8_t* candidates, int candidateCount, 
 
     for (int c = 0; c < candidateCount; c++) {
         Device* d = &devs[candidates[c]];
-        float x;
-        float y;
-        if (!calcPos(d, x, y, now)) continue;
+        PositionResult pos;
+        if (!calcTrilateration(d, pos, now)) continue;
+        uint8_t flags = bestRecentMacFlags(d, now);
 
-        char item[192];
+        char item[320];
         snprintf(
                 item,
                 sizeof(item),
-                "{\"id\":\"%08lX\",\"label\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"seen_nodes\":%d,\"best_rssi\":%d,\"count\":%lu}",
+                "{\"id\":\"%08lX\",\"label\":\"%s\",\"mac_type\":\"%s\",\"randomized_mac\":%s,\"x\":%.1f,\"y\":%.1f,\"seen_nodes\":%d,\"best_rssi\":%d,\"count\":%lu,\"distances\":[%.1f,%.1f,%.1f],\"fit_error\":%.1f}",
                 (unsigned long)d->hash,
                 deviceLabel(d->hash),
-                x,
-                y,
+                macTypeFromFlags(flags),
+                (flags & MAC_FLAG_RANDOMIZED) ? "true" : "false",
+                pos.x,
+                pos.y,
                 seenNodeCount(d, now),
                 bestRecentRssi(d, now),
-                (unsigned long)d->count);
+                (unsigned long)d->count,
+                pos.dist[0],
+                pos.dist[1],
+                pos.dist[2],
+                pos.fit_error);
 
         if (used + strlen(item) + (positionCount > 0 ? 1 : 0) >= sizeof(positions)) {
             break;
