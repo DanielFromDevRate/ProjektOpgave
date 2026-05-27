@@ -11,15 +11,22 @@ static const uint8_t COORD_MAC[6] = {0xEC, 0x64, 0xC9, 0x85, 0xF5, 0x8C};
 // Sniffer channel must match the WiFi AP channel the coordinator connects to
 #define SNIFFER_CHANNEL 2
 
-// Each sniffer gets a unique NODE_ID (1..NUM_NODES); coordinator uses 0
+// Each measuring ESP32 gets a unique NODE_ID (1..NUM_NODES).
+// With three boards total, the coordinator also sniffs as node 3.
+#ifndef NODE_ID
 #define NODE_ID 3
+#endif
 
 static const float NODE_POS[][2] = {
-    {  0,  0 },
-    {100,  0 },
-    { 50, 87 },
+    {  64.0f,   0.0f },
+    { -32.0f,  55.4f },
+    { -32.0f, -55.4f },
 };
 #define NUM_NODES 3
+
+#if NODE_ID < 1 || NODE_ID > NUM_NODES
+#error "NODE_ID must be between 1 and NUM_NODES"
+#endif
 
 // Coordinator WiFi / MQTT
 #define WIFI_SSID   "IoT_H3/4"
@@ -30,24 +37,45 @@ static const float NODE_POS[][2] = {
 #define MQTT_USER   "device07"
 #define MQTT_PASS   "madTdHrb"
 #define MQTT_BASE_TOPIC       "/devices/device07"
-#define MQTT_SNIFFER_TOPIC    MQTT_BASE_TOPIC "/sniffer_result"
-#define MQTT_POSITION_TOPIC   MQTT_BASE_TOPIC "/position"
+#define MQTT_SNIFFER_TOPIC    MQTT_BASE_TOPIC "/sniffer_results"
+#define MQTT_POSITION_TOPIC   MQTT_BASE_TOPIC "/positions"
 
-// Keep true while discovering devices. Set false after filling ALLOWED_DEVICE_HASHES.
+// Keep true for iPhone/demo proximity mode. iPhones randomize probe MACs, so a
+// static hash allow-list only works reliably for devices with stable MACs.
 #define ALLOW_ALL_DEVICES true
 
 // Add allowed device hashes here after discovering them from the sniffer Serial output.
 static const uint32_t ALLOWED_DEVICE_HASHES[] = {
-    0,
+    0x80465F21,
     //0x782C50E5,
     //0x5851599B,
 };
 #define NUM_ALLOWED_DEVICES (sizeof(ALLOWED_DEVICE_HASHES) / sizeof(ALLOWED_DEVICE_HASHES[0]))
 
-// Sniffer noise filtering. Raise MIN_REPORT_RSSI to only keep closer devices.
-#define MIN_REPORT_RSSI -75
+// Add known hashes here to make MQTT output readable. Set SHOW_ONLY_KNOWN_DEVICES
+// true after adding your PC hash if you only want your own devices in MQTT.
+#define SHOW_ONLY_KNOWN_DEVICES false
+
+struct KnownDevice {
+    uint32_t hash;
+    const char* label;
+};
+
+static const KnownDevice KNOWN_DEVICES[] = {
+    {0x80465F21, "test_device"},
+    {0x1A2F4832, "daniel_pc"},
+};
+#define NUM_KNOWN_DEVICES (sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]))
+
+// Proximity filtering. Raise MIN_REPORT_RSSI to only keep closer devices.
+#define MAX_PUBLISHED_DEVICES 4
+#define MIN_REPORT_RSSI -65
 #define SAME_DEVICE_REPORT_INTERVAL_MS 2000
 #define REPORT_INTERVAL_MS 10000
+#define PUBLISH_BATCH_INTERVAL_MS 10000
+#define DEVICE_STALE_AFTER_MS 30000
+#define MIN_POSITION_NODES 2
+#define MQTT_PACKET_BUFFER_SIZE 1024
 
 // RSSI → distance model:  d = 10 ^ ((TX_POWER - rssi) / (10 * PATH_N))
 #define TX_POWER  -59.0f   // measured RSSI at 1 m
@@ -75,6 +103,17 @@ static bool isAllowedDevice(uint32_t hash) {
         if (ALLOWED_DEVICE_HASHES[i] == hash) return true;
     }
     return false;
+}
+
+static const char* deviceLabel(uint32_t hash) {
+    for (size_t i = 0; i < NUM_KNOWN_DEVICES; i++) {
+        if (KNOWN_DEVICES[i].hash == hash) return KNOWN_DEVICES[i].label;
+    }
+    return "unknown";
+}
+
+static bool isKnownDevice(uint32_t hash) {
+    return strcmp(deviceLabel(hash), "unknown") != 0;
 }
 
 // ═══════════════════════════ SNIFFER ═════════════════════════════════════════
@@ -299,17 +338,6 @@ enum NetState { WIFI_CONNECTING, NTP_SYNCING, MQTT_CONNECTING, NET_READY };
 static NetState netState = WIFI_CONNECTING;
 static uint32_t netStateStart = 0;
 
-struct QueuedRssiReport {
-    RssiReport report;
-    uint32_t received_ms;
-};
-
-#define RSSI_REPORT_QUEUE_SIZE 24
-static QueuedRssiReport rssiReportQueue[RSSI_REPORT_QUEUE_SIZE];
-static volatile uint8_t rssiReportHead = 0;
-static volatile uint8_t rssiReportTail = 0;
-static portMUX_TYPE rssiReportMux = portMUX_INITIALIZER_UNLOCKED;
-
 static bool getTimestamp(char* buf, size_t len, uint32_t timeoutMs = 100) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, timeoutMs)) {
@@ -324,6 +352,7 @@ struct Device {
     uint32_t hash;
     int8_t   rssi[NUM_NODES];
     bool     seen[NUM_NODES];
+    uint32_t node_ts[NUM_NODES];
     uint32_t ts;
     uint32_t count;
 };
@@ -331,6 +360,39 @@ struct Device {
 #define MAX_DEV 20
 static Device devs[MAX_DEV];
 static int    ndev = 0;
+
+#define COORD_RECENT_DEVICE_COUNT 24
+struct CoordRecentDevice {
+    uint32_t hash;
+    uint32_t last_ms;
+};
+
+static CoordRecentDevice coordRecentDevices[COORD_RECENT_DEVICE_COUNT];
+static uint32_t coordProbeCount = 0;
+static uint32_t coordReportCount = 0;
+
+static bool shouldKeepCoordinatorProbe(uint32_t hash, int8_t rssi) {
+    if (rssi < MIN_REPORT_RSSI) return false;
+
+    uint32_t now = millis();
+    int empty = -1;
+    int oldest = 0;
+
+    for (int i = 0; i < COORD_RECENT_DEVICE_COUNT; i++) {
+        if (coordRecentDevices[i].hash == hash) {
+            if (now - coordRecentDevices[i].last_ms < SAME_DEVICE_REPORT_INTERVAL_MS) return false;
+            coordRecentDevices[i].last_ms = now;
+            return true;
+        }
+        if (coordRecentDevices[i].hash == 0 && empty < 0) empty = i;
+        if (coordRecentDevices[i].last_ms < coordRecentDevices[oldest].last_ms) oldest = i;
+    }
+
+    int slot = (empty >= 0) ? empty : oldest;
+    coordRecentDevices[slot].hash = hash;
+    coordRecentDevices[slot].last_ms = now;
+    return true;
+}
 
 static void startNTP() {
     Serial.printf("\n[WiFi] OK IP=%s MAC=%s Channel=%d GW=%s DNS=%s\n",
@@ -349,6 +411,7 @@ static void startNTP() {
 
 static void startMQTT() {
     wc.setInsecure();  // TLS without certificate verification
+    mqtt.setBufferSize(MQTT_PACKET_BUFFER_SIZE);
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     Serial.printf("[MQTT] Connecting to %s:%d...\n", MQTT_HOST, MQTT_PORT);
     netState = MQTT_CONNECTING;
@@ -369,39 +432,6 @@ static bool publishMqtt(const char* topic, const char* payload) {
     return ok;
 }
 
-static bool queueRssiReport(const RssiReport& report) {
-    portENTER_CRITICAL(&rssiReportMux);
-    uint8_t next = (rssiReportHead + 1) % RSSI_REPORT_QUEUE_SIZE;
-    if (next == rssiReportTail) {
-        portEXIT_CRITICAL(&rssiReportMux);
-        return false;
-    }
-    rssiReportQueue[rssiReportHead].report = report;
-    rssiReportQueue[rssiReportHead].received_ms = millis();
-    rssiReportHead = next;
-    portEXIT_CRITICAL(&rssiReportMux);
-    return true;
-}
-
-static bool peekRssiReport(QueuedRssiReport& queued) {
-    portENTER_CRITICAL(&rssiReportMux);
-    if (rssiReportTail == rssiReportHead) {
-        portEXIT_CRITICAL(&rssiReportMux);
-        return false;
-    }
-    queued = rssiReportQueue[rssiReportTail];
-    portEXIT_CRITICAL(&rssiReportMux);
-    return true;
-}
-
-static void dropQueuedRssiReport() {
-    portENTER_CRITICAL(&rssiReportMux);
-    if (rssiReportTail != rssiReportHead) {
-        rssiReportTail = (rssiReportTail + 1) % RSSI_REPORT_QUEUE_SIZE;
-    }
-    portEXIT_CRITICAL(&rssiReportMux);
-}
-
 static Device* getDevice(uint32_t hash) {
     for (int i = 0; i < ndev; i++)
         if (devs[i].hash == hash) return &devs[i];
@@ -409,6 +439,15 @@ static Device* getDevice(uint32_t hash) {
     memset(d, 0, sizeof(*d));
     d->hash = hash;
     return d;
+}
+
+static void rememberReport(const RssiReport& r) {
+    Device* d = getDevice(r.mac_hash);
+    d->rssi[r.node_id - 1] = r.rssi;
+    d->seen[r.node_id - 1] = true;
+    d->node_ts[r.node_id - 1] = millis();
+    d->ts = millis();
+    d->count++;
 }
 
 static void onRecv(const uint8_t*, const uint8_t* data, int len) {
@@ -419,20 +458,35 @@ static void onRecv(const uint8_t*, const uint8_t* data, int len) {
     Serial.printf("  node=%d hash=%08lX rssi=%d\n", r.node_id, (unsigned long)r.mac_hash, r.rssi);
     if (r.node_id < 1 || r.node_id > NUM_NODES) { Serial.printf("  bad node_id\n"); return; }
     if (!isAllowedDevice(r.mac_hash)) { Serial.printf("  blocked device\n"); return; }
-    if (!queueRssiReport(r)) Serial.println("  report queue full");
-    Device* d = getDevice(r.mac_hash);
-    d->rssi[r.node_id - 1] = r.rssi;
-    d->seen[r.node_id - 1] = true;
-    d->ts = millis();
-    d->count++;
+    rememberReport(r);
+}
+
+static void coordSniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_MGMT) return;
+    auto* pkt = (wifi_promiscuous_pkt_t*)buf;
+    if (pkt->rx_ctrl.sig_len < 24) return;
+    if (pkt->payload[0] != 0x40) return;
+
+    coordProbeCount++;
+    const uint8_t* mac = pkt->payload + 10;
+    RssiReport r = { NODE_ID, hashMac(mac), (int8_t)pkt->rx_ctrl.rssi };
+    if (!shouldKeepCoordinatorProbe(r.mac_hash, r.rssi)) return;
+    if (!isAllowedDevice(r.mac_hash)) return;
+
+    coordReportCount++;
+    rememberReport(r);
 }
 
 // Weighted centroid: weight = 1/d² where d = RSSI-derived distance
-static bool calcPos(Device* d, float& x, float& y) {
+static bool isRecentNode(Device* d, int nodeIndex, uint32_t now) {
+    return d->seen[nodeIndex] && now - d->node_ts[nodeIndex] <= DEVICE_STALE_AFTER_MS;
+}
+
+static bool calcPos(Device* d, float& x, float& y, uint32_t now) {
     float sw = 0, sx = 0, sy = 0;
     int n = 0;
     for (int i = 0; i < NUM_NODES; i++) {
-        if (!d->seen[i]) continue;
+        if (!isRecentNode(d, i, now)) continue;
         float dist = powf(10.0f, (TX_POWER - d->rssi[i]) / (10.0f * PATH_N));
         float w = 1.0f / (dist * dist + 1e-4f);
         sx += w * NODE_POS[i][0];
@@ -446,12 +500,147 @@ static bool calcPos(Device* d, float& x, float& y) {
     return true;
 }
 
-static int seenNodeCount(Device* d) {
+static int seenNodeCount(Device* d, uint32_t now) {
     int n = 0;
     for (int i = 0; i < NUM_NODES; i++) {
-        if (d->seen[i]) n++;
+        if (isRecentNode(d, i, now)) n++;
     }
     return n;
+}
+
+static int bestRecentRssi(Device* d, uint32_t now) {
+    int best = -128;
+    for (int i = 0; i < NUM_NODES; i++) {
+        if (isRecentNode(d, i, now) && d->rssi[i] > best) best = d->rssi[i];
+    }
+    return best;
+}
+
+static int selectPublishCandidates(uint8_t* indexes, uint32_t now) {
+    int count = 0;
+
+    for (int i = 0; i < ndev; i++) {
+        if (now - devs[i].ts > DEVICE_STALE_AFTER_MS) continue;
+        if (SHOW_ONLY_KNOWN_DEVICES && !isKnownDevice(devs[i].hash)) continue;
+        if (seenNodeCount(&devs[i], now) < MIN_POSITION_NODES) continue;
+        int candidateRssi = bestRecentRssi(&devs[i], now);
+        if (candidateRssi < MIN_REPORT_RSSI) continue;
+
+        int insertAt = count;
+        for (int j = 0; j < count; j++) {
+            if (candidateRssi > bestRecentRssi(&devs[indexes[j]], now)) {
+                insertAt = j;
+                break;
+            }
+        }
+
+        if (insertAt < MAX_PUBLISHED_DEVICES) {
+            int limit = (count < MAX_PUBLISHED_DEVICES) ? count : MAX_PUBLISHED_DEVICES - 1;
+            for (int j = limit; j > insertAt; j--) {
+                indexes[j] = indexes[j - 1];
+            }
+            indexes[insertAt] = i;
+            if (count < MAX_PUBLISHED_DEVICES) count++;
+        }
+    }
+
+    return count;
+}
+
+static bool appendJson(char* buffer, size_t bufferSize, size_t& used, const char* text) {
+    size_t len = strlen(text);
+    if (used + len >= bufferSize) return false;
+    memcpy(buffer + used, text, len + 1);
+    used += len;
+    return true;
+}
+
+static void publishSnifferBatch(const uint8_t* candidates, int candidateCount, const char* timestamp, bool timeSynced, uint32_t now) {
+    char results[720];
+    size_t used = 0;
+    int resultCount = 0;
+
+    results[0] = '\0';
+
+    for (int c = 0; c < candidateCount; c++) {
+        Device* d = &devs[candidates[c]];
+        for (int node = 0; node < NUM_NODES; node++) {
+            if (!isRecentNode(d, node, now)) continue;
+
+            char item[160];
+            snprintf(
+                    item,
+                    sizeof(item),
+                    "{\"id\":\"%08lX\",\"label\":\"%s\",\"node_id\":%d,\"rssi\":%d,\"received_ms\":%lu}",
+                    (unsigned long)d->hash,
+                    deviceLabel(d->hash),
+                    node + 1,
+                    d->rssi[node],
+                    (unsigned long)d->node_ts[node]);
+
+            if (used + strlen(item) + (resultCount > 0 ? 1 : 0) >= sizeof(results)) {
+                break;
+            }
+            if (resultCount > 0) appendJson(results, sizeof(results), used, ",");
+            appendJson(results, sizeof(results), used, item);
+            resultCount++;
+        }
+    }
+
+    char payload[MQTT_PACKET_BUFFER_SIZE];
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"sniffer_results\",\"timestamp\":\"%s\",\"time_synced\":%s,\"count\":%d,\"results\":[%s]}",
+             timestamp,
+             timeSynced ? "true" : "false",
+             resultCount,
+             results);
+
+    publishMqtt(MQTT_SNIFFER_TOPIC, payload);
+}
+
+static void publishPositionBatch(const uint8_t* candidates, int candidateCount, const char* timestamp, bool timeSynced, uint32_t now) {
+    char positions[720];
+    size_t used = 0;
+    int positionCount = 0;
+
+    positions[0] = '\0';
+
+    for (int c = 0; c < candidateCount; c++) {
+        Device* d = &devs[candidates[c]];
+        float x;
+        float y;
+        if (!calcPos(d, x, y, now)) continue;
+
+        char item[192];
+        snprintf(
+                item,
+                sizeof(item),
+                "{\"id\":\"%08lX\",\"label\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"seen_nodes\":%d,\"best_rssi\":%d,\"count\":%lu}",
+                (unsigned long)d->hash,
+                deviceLabel(d->hash),
+                x,
+                y,
+                seenNodeCount(d, now),
+                bestRecentRssi(d, now),
+                (unsigned long)d->count);
+
+        if (used + strlen(item) + (positionCount > 0 ? 1 : 0) >= sizeof(positions)) {
+            break;
+        }
+        if (positionCount > 0) appendJson(positions, sizeof(positions), used, ",");
+        appendJson(positions, sizeof(positions), used, item);
+        positionCount++;
+    }
+
+    char payload[MQTT_PACKET_BUFFER_SIZE];
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"positions\",\"timestamp\":\"%s\",\"time_synced\":%s,\"count\":%d,\"positions\":[%s]}",
+             timestamp,
+             timeSynced ? "true" : "false",
+             positionCount,
+             positions);
+
+    publishMqtt(MQTT_POSITION_TOPIC, payload);
 }
 
 static void updateNetwork() {
@@ -519,53 +708,31 @@ void setup() {
     esp_now_init();
     esp_now_register_recv_cb(onRecv);
     Serial.println("ESP-NOW OK");
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(coordSniffCb);
+    Serial.printf("Coordinator also sniffing as node %d on WiFi channel %d\n", NODE_ID, WiFi.channel());
 }
 
 void loop() {
     updateNetwork();
 
     static uint32_t last = 0;
-    char buf[256];
-    char timestamp[32];
-    bool timeSynced = getTimestamp(timestamp, sizeof(timestamp));
-    if (mqttReady()) {
-        QueuedRssiReport queued;
-        while (peekRssiReport(queued)) {
-            snprintf(buf, sizeof(buf),
-                "{\"type\":\"sniffer_result\",\"id\":\"%08lX\",\"node_id\":%u,\"rssi\":%d,\"timestamp\":\"%s\",\"time_synced\":%s,\"received_ms\":%lu}",
-                (unsigned long)queued.report.mac_hash,
-                queued.report.node_id,
-                queued.report.rssi,
-                timestamp,
-                timeSynced ? "true" : "false",
-                (unsigned long)queued.received_ms);
-            bool ok = publishMqtt(MQTT_SNIFFER_TOPIC, buf);
-            if (!ok) break;
-            dropQueuedRssiReport();
-        }
-    }
-
-    if (millis() - last < REPORT_INTERVAL_MS) return;
+    if (millis() - last < PUBLISH_BATCH_INTERVAL_MS) return;
     last = millis();
     if (!mqttReady()) return;
 
     uint32_t now = millis();
-    for (int i = 0; i < ndev; i++) {
-        if (now - devs[i].ts > 30000) continue;  // discard stale entries (>30 s)
-        if (seenNodeCount(&devs[i]) < 2) continue;
-        float x, y;
-        if (!calcPos(&devs[i], x, y)) continue;
-        snprintf(buf, sizeof(buf),
-            "{\"type\":\"position\",\"id\":\"%08lX\",\"timestamp\":\"%s\",\"time_synced\":%s,\"uptime_ms\":%lu,\"last_seen_ms\":%lu,\"count\":%lu,\"x\":%.1f,\"y\":%.1f}",
-            (unsigned long)devs[i].hash,
-            timestamp,
-            timeSynced ? "true" : "false",
-            (unsigned long)now,
-            (unsigned long)devs[i].ts,
-            (unsigned long)devs[i].count,
-            x, y);
-        publishMqtt(MQTT_POSITION_TOPIC, buf);
-    }
+    char timestamp[32];
+    bool timeSynced = getTimestamp(timestamp, sizeof(timestamp));
+    uint8_t candidates[MAX_PUBLISHED_DEVICES];
+    int candidateCount = selectPublishCandidates(candidates, now);
+
+    publishSnifferBatch(candidates, candidateCount, timestamp, timeSynced, now);
+    publishPositionBatch(candidates, candidateCount, timestamp, timeSynced, now);
+    Serial.printf("Coordinator probe requests seen: %lu, kept after filters: %lu\n",
+                  (unsigned long)coordProbeCount,
+                  (unsigned long)coordReportCount);
 }
 
 #endif
